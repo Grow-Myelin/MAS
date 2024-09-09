@@ -1,0 +1,8 @@
+anthropic
+asyncio
+aiohttp
+duckdb
+cachetools
+PyMuPDF
+Pillow
+tiktoken
