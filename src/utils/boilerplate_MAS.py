@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Literal
 from anthropic import AsyncAnthropic
 import json
 import os
@@ -8,29 +8,46 @@ from dotenv import load_dotenv
 import time
 from functools import wraps
 import re
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError, ConfigDict
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Constants
-AVAILABLE_MODELS = [
+MAX_RETRIES = 5
+RETRY_DELAY = 60  # seconds
+API_RATE_LIMIT = 1  # requests per second
+
+# Define the available models as a Literal type
+AvailableModel = Literal[
     "claude-3-opus-20240229",
     "claude-3-5-sonnet-20240620",
     "claude-3-haiku-20240307"
 ]
-MAX_RETRIES = 5
-RETRY_DELAY = 60  # seconds
-API_RATE_LIMIT = 1  # requests per second
+
+class AvailableModelsConfig(BaseModel):
+    models: List[AvailableModel] = Field(
+        default=[
+            "claude-3-opus-20240229",
+            "claude-3-5-sonnet-20240620",
+            "claude-3-haiku-20240307"
+        ]
+    )
+
+# Create an instance of the config
+AVAILABLE_MODELS_CONFIG = AvailableModelsConfig()
+
+# Use the validated models list
+AVAILABLE_MODELS = AVAILABLE_MODELS_CONFIG.models
 
 class RateLimiterModel(BaseModel):
     rate_limit: float = Field(..., gt=0)
 
 class RateLimiter:
     def __init__(self, rate_limit: float):
-        model = RateLimiterModel(rate_limit=rate_limit)
-        self.rate_limit = model.rate_limit
+        validated_data = RateLimiterModel.model_validate({"rate_limit": rate_limit})
+        self.rate_limit = validated_data.rate_limit
         self.tokens = self.rate_limit
         self.updated_at = time.time()
 
@@ -56,19 +73,38 @@ class BaseAgentModel(BaseModel):
 
 class BaseAgent:
     def __init__(self, client: AsyncAnthropic):
-        model = BaseAgentModel(client=client)
-        self.client = model.client
+        validated_data = BaseAgentModel.model_validate({"client": client})
+        self.client = validated_data.client
 
     @rate_limited
-    async def call_api(self, system_prompt: str, prompt: str, model: str = "claude-3-sonnet-20240320", max_tokens: int = 1000, temperature: float = 0.0) -> str:
+    async def call_api(self, system_prompt: str, prompt: str, model: AvailableModel = "claude-3-5-sonnet-20240620", max_tokens: int = 1000, temperature: float = 0.0) -> str:
+        class CallAPIModel(BaseModel):
+            system_prompt: str
+            prompt: str
+            model: AvailableModel
+            max_tokens: int = Field(..., gt=0)
+            temperature: float = Field(..., ge=0, le=1)
+
+        try:
+            validated_data = CallAPIModel.model_validate({
+                "system_prompt": system_prompt,
+                "prompt": prompt,
+                "model": model,
+                "max_tokens": max_tokens,
+                "temperature": temperature
+            })
+        except ValidationError as e:
+            logger.error(f"Validation error in call_api: {e}")
+            raise
+
         for attempt in range(MAX_RETRIES):
             try:
                 response = await self.client.messages.create(
-                    model=model,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    system=system_prompt,
-                    messages=[{"role": "user", "content": prompt}]
+                    model=validated_data.model,
+                    max_tokens=validated_data.max_tokens,
+                    temperature=validated_data.temperature,
+                    system=validated_data.system_prompt,
+                    messages=[{"role": "user", "content": validated_data.prompt}]
                 )
                 return response.content[0].text
             except Exception as e:
@@ -99,10 +135,19 @@ class PlannerAgentModel(BaseModel):
 
 class PlannerAgent(BaseAgent):
     def __init__(self, client: AsyncAnthropic):
-        model = PlannerAgentModel(client=client)
-        super().__init__(model.client)
+        validated_data = PlannerAgentModel.model_validate({"client": client})
+        super().__init__(validated_data.client)
 
     async def create_plan(self, task: str) -> Dict[str, Any]:
+        class CreatePlanModel(BaseModel):
+            task: str
+
+        try:
+            validated_data = CreatePlanModel.model_validate({"task": task})
+        except ValidationError as e:
+            logger.error(f"Validation error in create_plan: {e}")
+            raise
+
         system_prompt = f"""
         You are a planning expert. Create a structured plan for the given task.
         Your response must be a valid JSON object with the following structure:
@@ -122,14 +167,20 @@ class PlannerAgent(BaseAgent):
         {AVAILABLE_MODELS}
         Assign models strategically, considering that Opus is most capable but slowest, Haiku is fastest but least capable, and Sonnet is a balance between the two.
         """
-        prompt = f"Create a detailed plan for the following task: {task}"
+        prompt = f"Create a detailed plan for the following task: {validated_data.task}"
         
         response = await self.call_api(system_prompt, prompt, model="claude-3-opus-20240229", temperature=0.3)
         
         result = self.extract_json_data(response)
         if not result:
             logger.warning("Failed to create a valid plan. Returning a default plan.")
-            return {"plan": [{"step_number": 1, "description": "Execute the task", "expected_outcome": "Task completed", "assigned_model": "claude-3-sonnet-20240320"}]}
+            return {"plan": [{"step_number": 1, "description": "Execute the task", "expected_outcome": "Task completed", "assigned_model": "claude-3-5-sonnet-20240620"}]}
+        
+        # Validate the assigned models in the plan
+        for step in result.get('plan', []):
+            if step.get('assigned_model') not in AVAILABLE_MODELS:
+                logger.warning(f"Invalid model {step.get('assigned_model')} assigned. Using default model.")
+                step['assigned_model'] = "claude-3-5-sonnet-20240620"
         
         logger.info(f"Created plan: {result}")
         return result
@@ -139,10 +190,19 @@ class ExecutorAgentModel(BaseModel):
 
 class ExecutorAgent(BaseAgent):
     def __init__(self, client: AsyncAnthropic):
-        model = ExecutorAgentModel(client=client)
-        super().__init__(model.client)
+        validated_data = ExecutorAgentModel.model_validate({"client": client})
+        super().__init__(validated_data.client)
 
     async def execute_step(self, step: Dict[str, Any]) -> Dict[str, Any]:
+        class ExecuteStepModel(BaseModel):
+            step: Dict[str, Any]
+
+        try:
+            validated_data = ExecuteStepModel.model_validate({"step": step})
+        except ValidationError as e:
+            logger.error(f"Validation error in execute_step: {e}")
+            raise
+
         system_prompt = """
         You are an expert at executing tasks. Perform the given step and report the results.
         Your response must be a valid JSON object with the following structure:
@@ -156,16 +216,20 @@ class ExecutorAgent(BaseAgent):
         }
         Ensure your response can be parsed as JSON. Do not include any text outside the JSON structure.
         """
-        prompt = f"Execute and report on the following step: {json.dumps(step)}"
+        prompt = f"Execute and report on the following step: {json.dumps(validated_data.step)}"
         
-        model = step.get("assigned_model", "claude-3-sonnet-20240320")
+        model = validated_data.step.get("assigned_model", "claude-3-5-sonnet-20240620")
+        if model not in AVAILABLE_MODELS:
+            logger.warning(f"Invalid model {model} assigned. Using default model.")
+            model = "claude-3-5-sonnet-20240620"
+        
         response = await self.call_api(system_prompt, prompt, model=model, temperature=0.2)
         
         result = self.extract_json_data(response)
         if not result:
-            logger.warning(f"Failed to execute step {step.get('step_number', 'unknown')}. Returning a default result.")
+            logger.warning(f"Failed to execute step {validated_data.step.get('step_number', 'unknown')}. Returning a default result.")
             return {
-                "step_number": step.get("step_number", "unknown"),
+                "step_number": validated_data.step.get("step_number", "unknown"),
                 "action_taken": "Failed to execute step",
                 "outcome": "Execution failed due to invalid response",
                 "success": False,
@@ -181,10 +245,25 @@ class SynthesizerAgentModel(BaseModel):
 
 class SynthesizerAgent(BaseAgent):
     def __init__(self, client: AsyncAnthropic):
-        model = SynthesizerAgentModel(client=client)
-        super().__init__(model.client)
+        validated_data = SynthesizerAgentModel.model_validate({"client": client})
+        super().__init__(validated_data.client)
 
     async def synthesize(self, task: str, execution_results: List[Dict[str, Any]], output_file: str) -> str:
+        class SynthesizeModel(BaseModel):
+            task: str
+            execution_results: List[Dict[str, Any]]
+            output_file: str
+
+        try:
+            validated_data = SynthesizeModel.model_validate({
+                "task": task,
+                "execution_results": execution_results,
+                "output_file": output_file
+            })
+        except ValidationError as e:
+            logger.error(f"Validation error in synthesize: {e}")
+            raise
+
         system_prompt = """
         You are an expert at synthesizing information and writing comprehensive reports.
         Analyze the results from multiple executed steps and provide a detailed, well-structured report.
@@ -206,10 +285,10 @@ class SynthesizerAgent(BaseAgent):
         prompt = f"""
         Synthesize the results of the following task execution into a comprehensive report:
         
-        Original Task: {task}
+        Original Task: {validated_data.task}
         
         Execution Results:
-        {json.dumps(execution_results, indent=2)}
+        {json.dumps(validated_data.execution_results, indent=2)}
         
         Provide a detailed analysis of these results, including an assessment of overall success, key findings, challenges encountered, and recommendations for future actions.
         """
@@ -217,10 +296,10 @@ class SynthesizerAgent(BaseAgent):
         response = await self.call_api(system_prompt, prompt, model="claude-3-opus-20240229", max_tokens=4000, temperature=0.2)
         
         try:
-            with open(output_file, 'w', encoding='utf-8') as f:
+            with open(validated_data.output_file, 'w', encoding='utf-8') as f:
                 f.write(response)
-            logger.info(f"Synthesis report written to {output_file}")
-            return output_file
+            logger.info(f"Synthesis report written to {validated_data.output_file}")
+            return validated_data.output_file
         except IOError as e:
             error_message = f"Failed to write synthesis report: {str(e)}"
             logger.error(error_message)
@@ -231,40 +310,53 @@ class OrchestratorModel(BaseModel):
 
 class Orchestrator:
     def __init__(self, api_key: str):
-        model = OrchestratorModel(api_key=api_key)
-        self.client = AsyncAnthropic(api_key=model.api_key)
+        validated_data = OrchestratorModel.model_validate({"api_key": api_key})
+        self.client = AsyncAnthropic(api_key=validated_data.api_key)
         self.planner = PlannerAgent(self.client)
         self.executor = ExecutorAgent(self.client)
         self.synthesizer = SynthesizerAgent(self.client)
 
     async def execute_task(self, task: str, output_file: str = "synthesis_report.txt") -> Dict[str, Any]:
-        logger.info(f"Starting execution of task: {task}")
+        class ExecuteTaskModel(BaseModel):
+            task: str
+            output_file: str
+
+        try:
+            validated_data = ExecuteTaskModel.model_validate({
+                "task": task,
+                "output_file": output_file
+            })
+        except ValidationError as e:
+            logger.error(f"Validation error in execute_task: {e}")
+            raise
+
+        logger.info(f"Starting execution of task: {validated_data.task}")
         
         try:
-            plan = await self.planner.create_plan(task)
+            plan = await self.planner.create_plan(validated_data.task)
             
             execution_results = []
             for step in plan.get('plan', []):
                 step_result = await self.executor.execute_step(step)
                 execution_results.append(step_result)
             
-            synthesis_file = await self.synthesizer.synthesize(task, execution_results, output_file)
+            synthesis_file = await self.synthesizer.synthesize(validated_data.task, execution_results, validated_data.output_file)
             
             final_result = {
-                "task": task,
+                "task": validated_data.task,
                 "plan": plan,
                 "execution_results": execution_results,
                 "synthesis_report_file": synthesis_file,
                 "status": "completed"
             }
             
-            logger.info(f"Task execution and synthesis completed: {task}")
+            logger.info(f"Task execution and synthesis completed: {validated_data.task}")
             return final_result
         
         except Exception as e:
             logger.error(f"An error occurred during task execution: {str(e)}", exc_info=True)
             return {
-                "task": task,
+                "task": validated_data.task,
                 "status": "error",
                 "error_message": str(e)
             }
@@ -277,12 +369,25 @@ async def main():
         logger.error("API key not found. Please set the ANTHROPIC_API_KEY environment variable.")
         return
     
-    orchestrator = Orchestrator(api_key)
-    task = "Analyze the impact of artificial intelligence on job markets in the next decade."
-    output_file = "ai_impact_analysis.txt"
+    class MainConfigModel(BaseModel):
+        api_key: str
+        task: str
+        output_file: str
+
+    try:
+        config = MainConfigModel.model_validate({
+            "api_key": api_key,
+            "task": "Analyze the impact of artificial intelligence on job markets in the next decade.",
+            "output_file": "ai_impact_analysis.txt"
+        })
+    except ValidationError as e:
+        logger.error(f"Validation error in main configuration: {e}")
+        return
+
+    orchestrator = Orchestrator(config.api_key)
     
     try:
-        result = await orchestrator.execute_task(task, output_file)
+        result = await orchestrator.execute_task(config.task, config.output_file)
         print(json.dumps(result, indent=2))
         
         if result.get('status') == 'completed':
