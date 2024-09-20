@@ -259,7 +259,7 @@ class InteractivePlanningAgent(BaseAgent):
             }},
             ...
         ]
-        Assign models strategically, considering that Opus is most capable but slowest, Haiku is fastest but least capable, and Sonnet is a balance between the two.
+        Assign models strategically, considering that Claude-3-Opus is the most capable but slowest, Claude-3-Haiku is the fastest but least capable, and Claude-3-5-Sonnet is a balance between the two with the ability to cache information from previous calls.
         Ensure your response can be parsed as JSON. Do not include any text outside the JSON structure.
         """
         prompt = f"Create a detailed plan for the following task in the {self.domain} domain: {task}"
