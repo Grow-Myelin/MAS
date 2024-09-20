@@ -159,7 +159,7 @@ class BaseAgent:
                 ...
             ]
         }
-        Limit your response to 1-3 most critical questions. Ensure your response can be parsed as JSON.
+        Limit your response to the most critical questions. Ensure your response can be parsed as JSON.
         Before generating new questions, check the provided context for any existing answers.
         """
         prompt = f"Topic: {topic}\n\nContext: {context}\n\nBased on this information and considering any previously answered questions, what specific questions should we ask the user to gather more details or clarify any points?"

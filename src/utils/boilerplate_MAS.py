@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from anthropic import AsyncAnthropic
 import json
 import os
@@ -8,11 +8,11 @@ from dotenv import load_dotenv
 import time
 from functools import wraps
 import re
+from pydantic import BaseModel, Field
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
 
 # Constants
 AVAILABLE_MODELS = [
@@ -24,26 +24,17 @@ MAX_RETRIES = 5
 RETRY_DELAY = 60  # seconds
 API_RATE_LIMIT = 1  # requests per second
 
-class RateLimiter:
-    """
-    A rate limiter to control the frequency of API calls.
-    
-    This class implements a token bucket algorithm to limit the rate of API calls.
-    It ensures that calls are made at most at the specified rate limit.
-    """
+class RateLimiterModel(BaseModel):
+    rate_limit: float = Field(..., gt=0)
 
-    def __init__(self, rate_limit):
-        self.rate_limit = rate_limit
-        self.tokens = rate_limit
+class RateLimiter:
+    def __init__(self, rate_limit: float):
+        model = RateLimiterModel(rate_limit=rate_limit)
+        self.rate_limit = model.rate_limit
+        self.tokens = self.rate_limit
         self.updated_at = time.time()
 
     async def acquire(self):
-        """
-        Acquire a token to make an API call.
-        
-        This method will delay the execution if the rate limit has been exceeded,
-        ensuring that subsequent calls adhere to the specified rate limit.
-        """
         now = time.time()
         time_passed = now - self.updated_at
         self.tokens = min(self.rate_limit, self.tokens + time_passed * self.rate_limit)
@@ -53,12 +44,6 @@ class RateLimiter:
         self.tokens -= 1
 
 def rate_limited(func):
-    """
-    A decorator to apply rate limiting to a function.
-    
-    This decorator ensures that the decorated function is called at most
-    at the rate specified by API_RATE_LIMIT.
-    """
     limiter = RateLimiter(API_RATE_LIMIT)
     @wraps(func)
     async def wrapper(*args, **kwargs):
@@ -66,9 +51,13 @@ def rate_limited(func):
         return await func(*args, **kwargs)
     return wrapper
 
+class BaseAgentModel(BaseModel):
+    client: AsyncAnthropic
+
 class BaseAgent:
     def __init__(self, client: AsyncAnthropic):
-        self.client = client
+        model = BaseAgentModel(client=client)
+        self.client = model.client
 
     @rate_limited
     async def call_api(self, system_prompt: str, prompt: str, model: str = "claude-3-sonnet-20240320", max_tokens: int = 1000, temperature: float = 0.0) -> str:
@@ -91,15 +80,9 @@ class BaseAgent:
                     raise
 
     def extract_json_data(self, response: str) -> Dict[str, Any]:
-        """
-        Extract JSON data from the API response, with improved error handling.
-        """
         try:
-            # Try to parse the entire response as JSON
             return json.loads(response)
         except json.JSONDecodeError:
-            # If that fails, try to find a JSON object within the response
-            import re
             json_match = re.search(r'\{(?:[^{}]|(?R))*\}', response, re.DOTALL)
             if json_match:
                 try:
@@ -108,12 +91,17 @@ class BaseAgent:
                         return result
                 except json.JSONDecodeError:
                     pass
-            
-            # If all else fails, log the error and return an empty dict
             logger.error(f"Failed to extract valid JSON from response: {response[:100]}...")
             return {}
 
+class PlannerAgentModel(BaseModel):
+    client: AsyncAnthropic
+
 class PlannerAgent(BaseAgent):
+    def __init__(self, client: AsyncAnthropic):
+        model = PlannerAgentModel(client=client)
+        super().__init__(model.client)
+
     async def create_plan(self, task: str) -> Dict[str, Any]:
         system_prompt = f"""
         You are a planning expert. Create a structured plan for the given task.
@@ -146,7 +134,14 @@ class PlannerAgent(BaseAgent):
         logger.info(f"Created plan: {result}")
         return result
 
+class ExecutorAgentModel(BaseModel):
+    client: AsyncAnthropic
+
 class ExecutorAgent(BaseAgent):
+    def __init__(self, client: AsyncAnthropic):
+        model = ExecutorAgentModel(client=client)
+        super().__init__(model.client)
+
     async def execute_step(self, step: Dict[str, Any]) -> Dict[str, Any]:
         system_prompt = """
         You are an expert at executing tasks. Perform the given step and report the results.
@@ -181,7 +176,14 @@ class ExecutorAgent(BaseAgent):
         logger.info(f"Executed step: {result}")
         return result
 
+class SynthesizerAgentModel(BaseModel):
+    client: AsyncAnthropic
+
 class SynthesizerAgent(BaseAgent):
+    def __init__(self, client: AsyncAnthropic):
+        model = SynthesizerAgentModel(client=client)
+        super().__init__(model.client)
+
     async def synthesize(self, task: str, execution_results: List[Dict[str, Any]], output_file: str) -> str:
         system_prompt = """
         You are an expert at synthesizing information and writing comprehensive reports.
@@ -224,9 +226,13 @@ class SynthesizerAgent(BaseAgent):
             logger.error(error_message)
             return "synthesis_error.txt"
 
+class OrchestratorModel(BaseModel):
+    api_key: str
+
 class Orchestrator:
     def __init__(self, api_key: str):
-        self.client = AsyncAnthropic(api_key=api_key)
+        model = OrchestratorModel(api_key=api_key)
+        self.client = AsyncAnthropic(api_key=model.api_key)
         self.planner = PlannerAgent(self.client)
         self.executor = ExecutorAgent(self.client)
         self.synthesizer = SynthesizerAgent(self.client)

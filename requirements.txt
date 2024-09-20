@@ -6,3 +6,4 @@ cachetools
 PyMuPDF
 Pillow
 tiktoken
+python-dotenv
