@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from typing import Dict, Any, List, Optional, Literal
+from typing import Dict, Any, Protocol, runtime_checkable, List, Optional,Literal,Union
 from anthropic import AsyncAnthropic
 import json
 import os
@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 import time
 from functools import wraps
 import re
-from pydantic import BaseModel, Field, ValidationError, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict,ValidationError
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -26,6 +26,17 @@ AvailableModel = Literal[
     "claude-3-haiku-20240307"
 ]
 
+# Protocols
+@runtime_checkable
+class UserInputProtocol(Protocol):
+    async def get_user_input(self, prompt: str) -> str:
+        ...
+
+@runtime_checkable
+class SimilarityCheckerProtocol(Protocol):
+    async def check_similarity(self, new_question: str, cached_questions: List[str]) -> Optional[str]:
+        ...
+
 class AvailableModelsConfig(BaseModel):
     models: List[AvailableModel] = Field(
         default=[
@@ -41,35 +52,136 @@ AVAILABLE_MODELS_CONFIG = AvailableModelsConfig()
 # Use the validated models list
 AVAILABLE_MODELS = AVAILABLE_MODELS_CONFIG.models
 
+# configuration models
+
+class BaseAgentConfig(BaseModel):
+    max_retries: int = Field(default=3, ge=1)
+    retry_delay: float = Field(default=1.0, ge=0)
+
+class APIConfig(BaseModel):
+    model: str = Field(default="claude-3-5-sonnet-20240620")
+    temperature: float = Field(default=0.0, ge=0, le=1)
+
+    @property
+    def max_tokens(self) -> int:
+        MODEL_MAX_TOKENS = {
+            "claude-3-opus-20240229": 4000,
+            "claude-3-5-sonnet-20240620": 8000,
+            "claude-3-haiku-20240307": 4000
+        }
+        return MODEL_MAX_TOKENS.get(self.model, 4000)
+
 class RateLimiterModel(BaseModel):
     rate_limit: float = Field(..., gt=0)
 
 class RateLimiter:
-    def __init__(self, rate_limit: float):
-        validated_data = RateLimiterModel.model_validate({"rate_limit": rate_limit})
-        self.rate_limit = validated_data.rate_limit
-        self.tokens = self.rate_limit
-        self.updated_at = time.time()
+    def __init__(self, calls: int, period: float):
+        self.calls = calls
+        self.period = period
+        self.semaphore = asyncio.Semaphore(calls)
+        self.task_queue = asyncio.Queue()
 
     async def acquire(self):
-        now = time.time()
-        time_passed = now - self.updated_at
-        self.tokens = min(self.rate_limit, self.tokens + time_passed * self.rate_limit)
-        self.updated_at = now
-        if self.tokens < 1:
-            await asyncio.sleep((1 - self.tokens) / self.rate_limit)
-        self.tokens -= 1
+        await self.semaphore.acquire()
+        asyncio.create_task(self.release_after_delay())
+
+    async def release_after_delay(self):
+        await asyncio.sleep(self.period)
+        self.semaphore.release()
 
 def rate_limited(func):
-    limiter = RateLimiter(API_RATE_LIMIT)
     @wraps(func)
-    async def wrapper(*args, **kwargs):
-        await limiter.acquire()
-        return await func(*args, **kwargs)
+    async def wrapper(self, *args, **kwargs):
+        await self.rate_limiter.acquire()
+        return await func(self, *args, **kwargs)
     return wrapper
+
+class ClarificationQuestion(BaseModel):
+    question: str
+    reason: str
+
+class ClarificationQuestions(BaseModel):
+    questions: List[ClarificationQuestion]
+
+class ClarificationResponse(BaseModel):
+    question: str
+    answer: str
+
+class ClarificationResponses(BaseModel):
+    responses: List[ClarificationResponse]
+
+class StructuredPrompt(BaseModel):
+    system_prompt: str = Field(..., description="The system prompt providing context and guidelines")
+    prompt: str = Field(..., description="The specific task prompt")
+    output_model: str = Field(..., description="Pydantic model structure for the expected output")
+    model: str = Field(default="claude-3-5-sonnet-20240620", description="The AI model to use")
+    temperature: float = Field(default=0.4, ge=0, le=1, description="Temperature setting for the AI model")
+    max_tokens: Optional[int] = Field(default=None, description="Maximum number of tokens for the response")
+    stop_sequences: Optional[List[str]] = Field(default=None, description="Sequences that will stop the AI's response")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata for the prompt")
+
+    def format_prompt(self, **kwargs) -> 'StructuredPrompt':
+        new_prompt = self.model_copy(deep=True)
+        new_prompt.prompt = new_prompt.prompt.format(**kwargs)
+        return new_prompt
+
+    def to_api_parameters(self) -> Dict[str, Any]:
+        return {
+            "model": self.model,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "stop_sequences": self.stop_sequences,
+            "system": self.system_prompt,
+            "messages": [{"role": "user", "content": self.prompt}]
+        }
+
+class PromptCatalog:
+    @staticmethod
+    def create_prompts_prompt() -> StructuredPrompt:
+        return StructuredPrompt(
+            system_prompt="""
+            You are an expert prompt engineer working for Anthropic. Create a system prompt and a task prompt for a helper agent based on the given domain, task, and required expertise.
+            Your response must be a valid JSON object that conforms to the Pydantic model structure provided in the output_model field.
+            The system prompt should provide context and guidelines for the helper agent's role and capabilities.
+            The task prompt should clearly articulate the specific task to be performed and instruct the agent to respond in a structured JSON format.
+            """,
+            prompt="""
+            Create prompts for a helper agent with the following details:
+            Domain: {domain}
+            Task: {task}
+            Required Expertise: {required_expertise}
+            Ensure that the task prompt explicitly instructs the helper agent to provide its response as a structured JSON object with clearly defined keys relevant to the task.
+            """,
+            output_model="""
+            class PromptOutput(BaseModel):
+                system_prompt: str
+                task_prompt: str
+            """,
+            metadata={
+                "purpose": "Generate system and task prompts for helper agents",
+                "version": "1.0"
+            }
+        )
+
+# Agent Models
 
 class BaseAgentModel(BaseModel):
     client: AsyncAnthropic
+    config: BaseAgentConfig
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+class UserInteractionManagerModel(BaseModel):
+    similarity_checker: SimilarityCheckerProtocol
+    base_agent: 'BaseAgent'
+    question_cache: Dict[str, str] = Field(default_factory=dict)
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+class SimilarityCheckerModel(BaseModel):
+    base_agent: 'BaseAgent'
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
 class BaseAgent:
     def __init__(self, client: AsyncAnthropic):
@@ -129,6 +241,128 @@ class BaseAgent:
                     pass
             logger.error(f"Failed to extract valid JSON from response: {response[:100]}...")
             return {}
+
+class PromptAgent(BaseAgent):
+    async def create_prompts(self, domain: str, task: str, required_expertise: str) -> Dict[str, str]:
+        prompt_template = PromptCatalog.create_prompts_prompt()
+        formatted_prompt = prompt_template.format_prompt(
+            domain=domain,
+            task=task,
+            required_expertise=required_expertise
+        )
+        
+        logger.debug(f"PromptAgent - Input: Domain: {domain}, Task: {task}, Expertise: {required_expertise}")
+        
+        api_params = formatted_prompt.to_api_parameters()
+        response = await self.call_api(**api_params)
+        
+        logger.debug(f"PromptAgent - Raw Response: {response[:500]}...")
+        
+        try:
+            prompts_dict = json.loads(response)
+            # Here we could use Pydantic to validate the output if needed
+            logger.debug(f"PromptAgent - Extracted Prompts: {json.dumps(prompts_dict, indent=2)}")
+            return prompts_dict
+        except json.JSONDecodeError as e:
+            logger.error(f"Error parsing prompts: {e}. Using default prompts.")
+            return {
+                "system_prompt": f"You are an expert in {domain} with expertise in {required_expertise}. Provide detailed and structured responses.",
+                "task_prompt": f"Complete the following task: {task}. Provide your response in a structured JSON format."
+            }
+        
+class QuestionCacheEntry(BaseModel):
+    question: str
+    answer: str
+
+class GlobalQuestionCache(BaseModel):
+    cache: Dict[str, QuestionCacheEntry] = Field(default_factory=dict)
+
+    def add(self, question: str, answer: str):
+        self.cache[question] = QuestionCacheEntry(question=question, answer=answer)
+
+    def get(self, question: str) -> Optional[str]:
+        entry = self.cache.get(question)
+        return entry.answer if entry else None
+
+    def get_all(self) -> Dict[str, str]:
+        return {k: v.answer for k, v in self.cache.items()}
+
+    def get_all_questions(self) -> List[str]:
+        return list(self.cache.keys())
+
+class SimilarityCheckerConfig(BaseModel):
+    model: str = Field(default="claude-3-5-sonnet-20240620")
+    max_tokens: int = Field(default=2000,ge=500,le=4000)
+    temperature: float = Field(default=0.0, ge=0, le=1)
+    rate_limit_calls: int = Field(default=5,ge=0,le=10)
+    rate_limit_period: float = Field(default=1.0,ge=1.0,le=5.0)
+
+class SimilarityChecker(BaseModel):
+    client: AsyncAnthropic
+    config: SimilarityCheckerConfig = Field(default_factory=SimilarityCheckerConfig)
+    rate_limiter: RateLimiter = Field(default=None)
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    def __init__(self, **data):
+        super().__init__(**data)
+        self.rate_limiter = RateLimiter(
+            self.config.rate_limit_calls, 
+            self.config.rate_limit_period
+        )
+
+    @rate_limited
+    async def check_similarity(self, new_question: str, cached_questions: List[str]) -> Optional[str]:
+        system_prompt = """
+        You are a quick-thinking AI assistant specializing in identifying similar questions.
+        Your task is to determine if a new question is similar to any of the previously asked questions.
+        If you find a similar question, return its exact text. If not, return "No similar question found."
+        Respond only with the similar question or the "No similar question found" message.
+        """
+        prompt = f"""
+        New question: {new_question}
+        Previously asked questions:
+        {json.dumps(cached_questions, indent=2)}
+        Is the new question similar to any of the previously asked questions?
+        """
+        try:
+            response = await self.client.messages.create(
+                model=self.config.model,
+                max_tokens=self.config.max_tokens,
+                temperature=self.config.temperature,
+                system=system_prompt,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            result = response.content[0].text.strip()
+            return result if "No similar question found" not in result else None
+        except Exception as e:
+            logger.error(f"Error in check_similarity: {e}")
+            return None
+        
+class UserInteractionManager(BaseModel):
+    global_cache: GlobalQuestionCache
+    similarity_checker: SimilarityChecker
+
+    class Config:
+        arbitrary_types_allowed = True
+
+    async def get_user_input(self, prompt: str) -> str:
+        similar_question = await self.similarity_checker.check_similarity(
+            prompt, 
+            self.global_cache.get_all_questions()
+        )
+        
+        if similar_question:
+            cached_response = self.global_cache.get(similar_question)
+            print(f"Found similar question: '{similar_question}'")
+            print(f"Using cached response: '{cached_response}'")
+            return cached_response
+
+        # In a real async environment, you might want to use an async input method
+        response = input(prompt + "\nYour response: ")
+        self.global_cache.add(prompt, response)
+        return response
+    
 
 class PlannerAgentModel(BaseModel):
     client: AsyncAnthropic
