@@ -110,25 +110,27 @@ class APIConfig(BaseModel):
 
 class RateLimiter:
     """Implements rate limiting for API calls."""
-    def __init__(self, rate_limit: float):
+    def __init__(self, rate_limit_calls: int, rate_limit_period: float):
         """
         Initialize the RateLimiter.
         Args:
-        rate_limit (float): Number of calls allowed per second.
+        rate_limit_calls (int): Number of calls allowed per period.
+        rate_limit_period (float): Time period for rate limiting in seconds.
         """
-        self.rate_limit = rate_limit
-        self.tokens = rate_limit
+        self.rate_limit_calls = rate_limit_calls
+        self.rate_limit_period = rate_limit_period
+        self.tokens = rate_limit_calls
         self.updated_at = time.time()
 
     async def acquire(self):
         """Acquire a slot for an API call."""
         now = time.time()
         time_passed = now - self.updated_at
-        self.tokens = min(self.rate_limit, self.tokens + time_passed * self.rate_limit)
+        self.tokens = min(self.rate_limit_calls, self.tokens + time_passed * self.rate_limit_calls / self.rate_limit_period)
         self.updated_at = now
 
         if self.tokens < 1:
-            await asyncio.sleep((1 - self.tokens) / self.rate_limit)
+            await asyncio.sleep((1 - self.tokens) * self.rate_limit_period / self.rate_limit_calls)
         self.tokens -= 1
 
 def rate_limited(func):
@@ -139,7 +141,7 @@ def rate_limited(func):
     Returns:
     A wrapper function that applies rate limiting.
     """
-    limiter = RateLimiter(API_RATE_LIMIT)
+    limiter = RateLimiter(API_RATE_LIMIT, 1.0)  # Assuming a rate limit period of 1 second
 
     @wraps(func)
     async def wrapper(*args, **kwargs):
@@ -428,13 +430,13 @@ class SimilarityChecker(BaseModel):
     config: SimilarityCheckerConfig = Field(default_factory=SimilarityCheckerConfig)
     rate_limiter: RateLimiter = Field(default=None)
 
-    model_config = ConfigDict(arbitrary_types_allowed=True)
+    class Config:
+        arbitrary_types_allowed = True
 
-    def __init__(self, **data):
-        """Initialize the SimilarityChecker with rate limiting."""
-        super().__init__(**data)
+    def __init__(self, client: AsyncAnthropic, **data):
+        super().__init__(client=client, **data)
         self.rate_limiter = RateLimiter(
-            self.config.rate_limit_calls, 
+            self.config.rate_limit_calls,
             self.config.rate_limit_period
         )
 
@@ -518,13 +520,15 @@ class UserInteractionManager(BaseModel):
 class BaseAgent(BaseModel):
     client: AsyncAnthropic
     config: Dict[str, Any] = Field(default_factory=dict)
+    user_interaction_manager: UserInteractionManager
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     @classmethod
-    def create(cls, client: AsyncAnthropic, **config):
-        return cls(client=client, config=config)
-    
+    def create(cls, client: AsyncAnthropic, user_interaction_manager: UserInteractionManager, **config):
+        return cls(client=client, user_interaction_manager=user_interaction_manager, config=config)
+
+
     def create_structured_prompt(
         self,
         system_prompt: str,
@@ -624,17 +628,24 @@ class BaseAgent(BaseModel):
                 else:
                     raise
 
-    async def ask_for_clarification(self, topic: str, context: str, user_input_handler: UserInputProtocol) -> ClarificationResponses:
+    async def ask_for_clarification(self, topic: str, context: str) -> Dict[str, Any]:
         clarification_prompt = self.create_structured_prompt(
             system_prompt="""
             You are an AI assistant helping to create a business plan. Your task is to identify areas in the given context that need clarification or more information from the user.
-            Generate specific questions that will help gather the necessary details.
+            Generate specific questions that will help gather the necessary details, taking into account the actual task and the content of the business plan section.
             """,
             user_prompt=f"""
+            Task: {self.user_interaction_manager.global_cache.get('task')}
             Topic: {topic}
             Context: {context}
 
-            Based on this information, what specific questions should we ask the user to gather more details or clarify any points?
+            Based on the task and the content of the '{topic}' section, what specific questions should we ask the user to gather more details or clarify any points?
+            Consider the following:
+            1. Key elements that may be missing or unclear in the section
+            2. Assumptions that need validation
+            3. Industry or market-specific details that could enhance the section
+            4. Alignment with the overall task and business objectives
+
             Provide your response as a JSON object that conforms to the following Pydantic model:
 
             class ClarificationQuestions(BaseModel):
@@ -644,7 +655,7 @@ class BaseAgent(BaseModel):
                 question: str
                 reason: str
 
-            Limit your response to the most critical questions (maximum 5).
+            Limit your response to the most critical questions (maximum 3).
             Ensure your response can be parsed directly into these Pydantic models.
             """,
             output_schema=ClarificationQuestions,
@@ -659,17 +670,20 @@ class BaseAgent(BaseModel):
         except Exception as e:
             logger.error(f"Failed to generate clarification questions: {e}")
             logger.error(traceback.format_exc())
-            return ClarificationResponses(responses=[])
+            return {}
 
-        user_responses = []
-        for question in clarification_questions.questions:
-            logger.info(f"Asking clarification question: {question.question}")
-            logger.debug(f"Reason for asking: {question.reason}")
-            user_response = await user_input_handler.get_user_input(question.question)
-            user_responses.append(ClarificationResponse(question=question.question, answer=user_response))
+        user_responses = {}
+        for question_dict in clarification_questions.questions:  # Iterate over the list of question dictionaries
+            question = question_dict['question']  # Access the 'question' key from the dictionary
+            reason = question_dict['reason']  # Access the 'reason' key from the dictionary
 
-        return ClarificationResponses(responses=user_responses)
+            logger.info(f"Asking clarification question: {question}")
+            logger.debug(f"Reason for asking: {reason}")
+            user_response = await self.user_interaction_manager.get_user_input(question)
+            user_responses[question] = user_response
 
+        return user_responses
+    
 class PromptAgent(BaseAgent):
     """Agent for creating prompts."""
 
@@ -760,7 +774,7 @@ class PlannerAgent(BaseAgent):
             {", ".join(AvailableModel.__args__)}
             """,
             output_schema=TaskAssessment,
-            model="claude-3-opus-20240229",
+            model="claude-3-5-sonnet-20240620",
             temperature=0.4
         )
 
@@ -809,9 +823,33 @@ class PlannerAgent(BaseAgent):
         )
 
         try:
-            result = await self.call_api(plan_prompt)
-            logger.info(f"Created plan: {result}")
-            return Plan(**result.dict())  # Convert DynamicModel to dict before passing to Plan
+            initial_plan = await self.call_api(plan_prompt)
+            logger.info(f"Created initial plan: {initial_plan}")
+            
+            # Ask for clarification on each step
+            for step in initial_plan.plan:
+                clarification = await self.ask_for_clarification(f"Task: {step.description}", json.dumps(step.model_dump()))
+                if clarification:
+                    # Update the step based on user input
+                    update_prompt = self.create_structured_prompt(
+                        system_prompt="You are a planning expert. Update the given plan step based on user input.",
+                        user_prompt=f"""
+                        Original step: {json.dumps(step.model_dump())}
+                        User input: {json.dumps(clarification)}
+
+                        Update the step based on this user input. Provide your response as a JSON object that conforms to the PlanStep model.
+                        """,
+                        output_schema=PlanStep,
+                        model=assessment.recommended_model,
+                        temperature=0.3
+                    )
+                    updated_step = await self.call_api(update_prompt)
+                    step.description = updated_step.description
+                    step.details = updated_step.details
+
+            # Refine the plan after all clarifications
+            refined_plan = await self.refine_plan(initial_plan, task, assessment)
+            return refined_plan
         except Exception as e:
             logger.error(f"Failed to create a valid plan: {e}")
             logger.error(traceback.format_exc())
@@ -880,7 +918,43 @@ class ExecutorAgent(BaseAgent):
         results = []
         for step in plan.plan:
             result = await self._execute_single_step(step)
+            
+            # Ask for clarification on the execution result
+            clarification = await self.ask_for_clarification(f"Execution of step: {step.description}", json.dumps(result.model_dump()))
+            if clarification:
+                # Update the result based on user input
+                update_prompt = self.create_structured_prompt(
+                    system_prompt="You are an execution expert. Update the given execution result based on user input.",
+                    user_prompt=f"""
+                    Original result: {json.dumps(result.model_dump())}
+                    User input: {json.dumps(clarification)}
+
+                    Update the execution result based on this user input. Provide your response as a JSON object that conforms to the StepResult model.
+                    """,
+                    output_schema=StepResult,
+                    model=step.assigned_model,
+                    temperature=0.3
+                )
+                updated_result = await self.call_api(update_prompt)
+                result = updated_result
+
             results.append(result)
+            
+            # If the step failed, attempt recovery
+            if not result.success:
+                recovery_result = await self._attempt_recovery(step, result)
+                results.append(recovery_result)
+                if recovery_result.success:
+                    result = recovery_result
+                else:
+                    logger.warning(f"Recovery attempt for step {step.step_number} failed. Continuing with next step.")
+            
+            # Create a transition to the next step if there is one
+            if step.step_number < len(plan.plan):
+                next_step = plan.plan[step.step_number]
+                transition_result = await self._create_transition(result, next_step)
+                results.append(transition_result)
+
         return results
 
     async def _execute_single_step(self, step: PlanStep) -> StepResult:
@@ -1144,11 +1218,38 @@ class SynthesizerAgent(BaseAgent):
         try:
             report = await self.call_api(synthesis_prompt)
             
+            # Get user feedback on each section
+            for section_dict in report.sections:  # Iterate over the list of section dictionaries
+                title = section_dict['title']  # Access the 'title' key from the dictionary
+                content = section_dict['content']  # Access the 'content' key from the dictionary
+
+                feedback = await self.user_interaction_manager.get_user_input(f"Please provide any feedback or suggestions for the '{title}' section:")
+                if feedback.strip():
+                    # Update the section based on user feedback
+                    update_prompt = self.create_structured_prompt(
+                        system_prompt="You are an expert report writer. Update the given report section based on user feedback.",
+                        user_prompt=f"""
+                        Original section:
+                        Title: {title}
+                        Content: {content}
+
+                        User feedback: {feedback}
+
+                        Update the section based on this feedback. Provide your response as a JSON object that conforms to the ReportSection model.
+                        """,
+                        output_schema=ReportSection,
+                        model="claude-3-5-sonnet-20240620",
+                        temperature=0.3
+                    )
+                    updated_section = await self.call_api(update_prompt)
+                    section_dict['title'] = updated_section.title  # Update the 'title' key in the dictionary
+                    section_dict['content'] = updated_section.content  # Update the 'content' key in the dictionary
+            
             markdown_content = ""
-            for section in report.sections:
-                if isinstance(section, dict):
-                    section = ReportSection(**section)
-                markdown_content += f"# {section.title}\n\n{section.content}\n\n"
+            for section_dict in report.sections:  # Iterate over the list of section dictionaries
+                title = section_dict['title']  # Access the 'title' key from the dictionary
+                content = section_dict['content']  # Access the 'content' key from the dictionary
+                markdown_content += f"# {title}\n\n{content}\n\n"
             
             # Ensure we have a valid output file path
             if not output_file or not output_file.strip():
@@ -1177,7 +1278,7 @@ class SynthesizerAgent(BaseAgent):
             
             # Create an error report file
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            error_file = f"synthesis_error_{timestamp}.txt"
+            error_file = f"../../output_files/synthesis_error_{timestamp}.txt"
             with open(error_file, 'w', encoding='utf-8') as f:
                 f.write(f"Error occurred while generating synthesis report:\n{error_message}\n\nTraceback:\n{traceback.format_exc()}")
             
@@ -1188,8 +1289,8 @@ class AgentConfig(BaseModel):
     agent_class: Type[BaseAgent]
     config: Dict[str, Any] = Field(default_factory=dict)
 
-    def create_agent(self, client: AsyncAnthropic) -> BaseAgent:
-        return self.agent_class.create(client, **self.config)
+    def create_agent(self, client: AsyncAnthropic, user_interaction_manager: UserInteractionManager) -> BaseAgent:
+        return self.agent_class.create(client, user_interaction_manager, **self.config)
 
 class WorkflowStep(BaseModel):
     agent_name: str
@@ -1206,6 +1307,7 @@ class OrchestratorConfig(BaseModel):
     agents: Dict[str, AgentConfig]
     default_workflow: Workflow
     default_system_prompt: str = "You are an AI assistant helping with various tasks."
+    similarity_checker_config: SimilarityCheckerConfig = Field(default_factory=SimilarityCheckerConfig)
 
 def safe_get(d, key):
     return d.get(key, None)
@@ -1215,11 +1317,14 @@ class Orchestrator:
         self.config = config
         self.client = AsyncAnthropic(api_key=config.api_key)
         self.agents = {}
+        self.global_cache = GlobalQuestionCache()
+        self.similarity_checker = SimilarityChecker(self.client, config=self.config.similarity_checker_config)
+        self.user_interaction_manager = UserInteractionManager(global_cache=self.global_cache, similarity_checker=self.similarity_checker)
         self._initialize_agents()
 
     def _initialize_agents(self):
         for agent_name, agent_config in self.config.agents.items():
-            self.agents[agent_name] = agent_config.create_agent(self.client)
+            self.agents[agent_name] = agent_config.create_agent(self.client, self.user_interaction_manager)
 
     async def execute_workflow(self, workflow: Workflow, initial_context: Dict[str, Any]) -> Dict[str, Any]:
         context = initial_context.copy()
@@ -1295,10 +1400,9 @@ class Orchestrator:
                 "task": task,
                 "status": "error",
                 "error_message": str(e),
-                "output_file": f"error_report_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                "output_file": f"../../output_files/error_report_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
             }
         
-# Example usage:
 async def main():
     load_dotenv(override=True)
     api_key = os.getenv('ANTHROPIC_API_KEY')
@@ -1325,7 +1429,14 @@ async def main():
                 condition="safe_get(context, 'executor_execute_plan_result') is not None"
             ),
         ]),
-        default_system_prompt="You are an AI assistant analyzing complex topics."
+        default_system_prompt="You are an AI assistant analyzing complex topics.",
+        similarity_checker_config=SimilarityCheckerConfig(
+            model="claude-3-5-sonnet-20240620",
+            max_tokens=2000,
+            temperature=0.0,
+            rate_limit_calls=5,
+            rate_limit_period=1.0
+        )
     )
 
     orchestrator = Orchestrator(config)
@@ -1334,7 +1445,7 @@ async def main():
         output_file="../../output_files/business_plan.md",
         initial_prompt="You are an expert in business planning. Create a detailed business plan for the context provided.",
     )
-    print(json.dumps(result, indent=2,cls=PydanticJSONEncoder))
+    print(json.dumps(result, indent=2, cls=PydanticJSONEncoder))
 
 if __name__ == "__main__":
     asyncio.run(main())
