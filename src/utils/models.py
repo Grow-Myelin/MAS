@@ -1,3 +1,5 @@
+# not working, ignore
+
 import asyncio
 import logging
 from typing import Dict, Any, Protocol, runtime_checkable, List, Optional,Literal,Union
@@ -242,6 +244,57 @@ class BaseAgent:
             logger.error(f"Failed to extract valid JSON from response: {response[:100]}...")
             return {}
 
+    async def ask_for_clarification(self, topic: str, context: str, user_input_handler: UserInputProtocol) -> ClarificationResponses:
+        clarification_prompt = StructuredPrompt(
+            system_prompt="""
+            You are an AI assistant helping to create a business plan. Your task is to identify areas in the given context that need clarification or more information from the user.
+            Generate specific questions that will help gather the necessary details.
+            """,
+            prompt=f"""
+            Topic: {topic}
+            Context: {context}
+
+            Based on this information, what specific questions should we ask the user to gather more details or clarify any points?
+            Provide your response as a JSON object that conforms to the following Pydantic model:
+
+            class ClarificationQuestions(BaseModel):
+                questions: List[ClarificationQuestion]
+
+            class ClarificationQuestion(BaseModel):
+                question: str
+                reason: str
+
+            Limit your response to the most critical questions (maximum 5).
+            Ensure your response can be parsed directly into these Pydantic models.
+            """,
+            output_model="""
+            class ClarificationQuestions(BaseModel):
+                questions: List[ClarificationQuestion]
+
+            class ClarificationQuestion(BaseModel):
+                question: str
+                reason: str
+            """,
+            metadata={"purpose": "Generate clarification questions"}
+        )
+
+        response = await self.call_api(clarification_prompt)
+        questions_data = self.extract_json_data(response)
+        
+        try:
+            clarification_questions = ClarificationQuestions.model_validate(questions_data)
+        except ValueError as e:
+            logger.error(f"Failed to validate clarification questions: {e}")
+            return ClarificationResponses(responses=[])
+
+        user_responses = []
+        for question in clarification_questions.questions:
+            print(f"\nReason for asking: {question.reason}")
+            user_response = await user_input_handler.get_user_input(question.question)
+            user_responses.append(ClarificationResponse(question=question.question, answer=user_response))
+
+        return ClarificationResponses(responses=user_responses)
+    
 class PromptAgent(BaseAgent):
     async def create_prompts(self, domain: str, task: str, required_expertise: str) -> Dict[str, str]:
         prompt_template = PromptCatalog.create_prompts_prompt()
@@ -362,7 +415,6 @@ class UserInteractionManager(BaseModel):
         response = input(prompt + "\nYour response: ")
         self.global_cache.add(prompt, response)
         return response
-    
 
 class PlannerAgentModel(BaseModel):
     client: AsyncAnthropic

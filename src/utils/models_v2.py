@@ -1,3 +1,5 @@
+# v2 = interactive_business_planner + pydantic and complications
+
 import asyncio
 import json
 import logging
